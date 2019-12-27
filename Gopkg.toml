@@ -148,7 +148,8 @@
 
 [[constraint]]
   name = "github.com/Shopify/sarama"
-  version = "1.24.0"
+  branch = "event-hub-workaround"
+  source = "https://github.com/influxdata/sarama.git"
 
 [[constraint]]
   name = "github.com/soniah/gosnmp"

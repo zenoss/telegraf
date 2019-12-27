@@ -100,12 +100,13 @@
   version = "v0.4.9"
 
 [[projects]]
-  digest = "1:33f56caa9ab45fedc63d3d1d3e342d9f9d00726071f22c67d06b0cd26d49a55e"
+  branch = "event-hub-workaround"
+  digest = "1:f86f95edc82a536f54bc5b84062e12811f52565bc5be6de10e3efa110cd63b7e"
   name = "github.com/Shopify/sarama"
   packages = ["."]
   pruneopts = ""
-  revision = ""
-  version = "v1.24.1"
+  revision = "4b4fd6446629dee3c72d6245c854a34a0cfd6ae9"
+  source = "https://github.com/influxdata/sarama.git"
 
 [[projects]]
   digest = "1:f82b8ac36058904227087141017bb82f4b0fc58272990a4cdae3e2d6d222644e"
