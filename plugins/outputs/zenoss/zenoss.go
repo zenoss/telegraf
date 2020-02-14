@@ -2,19 +2,19 @@ package zenoss
 
 import (
 	"context"
-	"sort"
-	"hash/fnv"
-	"os"
 	"crypto/tls"
-	"encoding/json"
-	"encoding/binary"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/golang/protobuf/jsonpb"
 	structpb "github.com/golang/protobuf/ptypes/struct"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/outputs"
+	serializer "github.com/influxdata/telegraf/plugins/serializers/json"
+	"github.com/mitchellh/hashstructure"
 	zenoss "github.com/zenoss/zenoss-protobufs/go/cloud/data_receiver"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -38,18 +38,25 @@ var sampleConfig = `
 api_key = "secrete-key" # required
 
 #zenoss grpc endpoint
-#address = https://api.zenoss.io/
+#address = "api.zenoss.io:443"
 
 #stdout_client = false
+`
+var processorConfigHeader = `
+
+###############################################################################
+#                            ZENOSS PROCESSOR PLUGINS                         #
+###############################################################################
+
 `
 
 // Zenoss telgrap output type
 type Zenoss struct {
-	APIKey          string `toml:"api_key"`
-	Address         string
-	StdoutClient    bool
-	client          zenossClient
-	defaultMetaData map[string]string
+	APIKey            string `toml:"api_key"`
+	Address           string
+	StdoutClient      bool
+	client            zenossClient
+	defaultMetaData   map[string]string
 	defaultDimensions map[string]string
 }
 
@@ -64,6 +71,7 @@ var _ telegraf.Output = &Zenoss{}
 
 //Connect to the output
 func (z *Zenoss) Connect() error {
+	defer logElapsed("Connect", time.Now())
 	if z.StdoutClient {
 		z.client = &zClientTest{}
 	} else {
@@ -84,7 +92,11 @@ func (*Zenoss) Description() string {
 
 //SampleConfig for the output
 func (*Zenoss) SampleConfig() string {
-	return sampleConfig
+	b := strings.Builder{}
+	b.WriteString(sampleConfig)
+	b.WriteString(processorConfigHeader)
+	b.WriteString(vspherConfig)
+	return b.String()
 }
 
 //Write to metrics Zenoss
@@ -95,30 +107,35 @@ func (z *Zenoss) Write(metrics []telegraf.Metric) error {
 
 	db := newDataBuilder(z.defaultDimensions, z.defaultMetaData)
 	for _, metric := range metrics {
+		// mjson, _ := s.Serialize(metric)
+		// log.Printf("write metric: %s", string(mjson))
 		db.AddMetric(metric)
 	}
 	zMetrics, zModels := db.ZenossData()
 	metricResult := make(chan error)
 	go func() {
+		defer logElapsed("send metrics", time.Now())
 		defer close(metricResult)
-		metricStatus, err := z.client.PutMetrics(ctx, &zenoss.Metrics{
+		metricStatus, metricErr := z.client.PutMetrics(ctx, &zenoss.Metrics{
 			DetailedResponse: true,
 			Metrics:          zMetrics,
 		})
-		if err != nil {
-			log.Printf("ERROR: unable to send %d metrics: %v", len(zMetrics), err)
+		if metricErr != nil {
+			log.Printf("ERROR: unable to send %d metrics: %v", len(zMetrics), metricErr)
 		} else {
 			if metricStatus.GetFailed() > 0 {
 				log.Printf("ERROR: failed sending %d of %d metrics", metricStatus.GetFailed(), len(zMetrics))
 			}
 			log.Printf("sent %v metrics", metricStatus.GetSucceeded())
 		}
-		metricResult <- err
+		metricResult <- metricErr
 	}()
+	start := time.Now()
 	modelStatus, err := z.client.PutModels(ctx, &zenoss.Models{
 		DetailedResponse: true,
 		Models:           zModels,
 	})
+	logElapsed("send models", start)
 	if err != nil {
 		log.Printf("ERROR: unable to send %d models: %v", len(zModels), err)
 	} else {
@@ -159,10 +176,22 @@ func (z *zClient) Close() error {
 	return z.conn.Close()
 }
 func (z *zClient) PutMetrics(ctx context.Context, in *zenoss.Metrics, opts ...grpc.CallOption) (*zenoss.StatusResult, error) {
+	// log.Println("put metrics...")
+	// j, err := json.MarshalIndent(in, "", "  ")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// log.Println(string(j))
 	return z.client.PutMetrics(ctx, in, opts...)
 }
 
 func (z *zClient) PutModels(ctx context.Context, in *zenoss.Models, opts ...grpc.CallOption) (*zenoss.ModelStatusResult, error) {
+	// log.Println("put models...")
+	// j, err := json.MarshalIndent(in, "", "  ")
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// log.Println(string(j))
 	return z.client.PutModels(ctx, in, opts...)
 }
 
@@ -178,10 +207,12 @@ func (z *zClientTest) Close() error {
 	return nil
 }
 func (z *zClientTest) PutMetrics(ctx context.Context, in *zenoss.Metrics, opts ...grpc.CallOption) (*zenoss.StatusResult, error) {
-	j, err := json.MarshalIndent(in, "", "  ")
+	m := &jsonpb.Marshaler{Indent: "  "}
+	j, err := m.MarshalToString(in)
 	if err != nil {
 		return nil, err
 	}
+	log.Println(string(j))
 	result := &zenoss.StatusResult{
 		Succeeded: int32(len(in.Metrics)),
 		Message:   "all good",
@@ -190,10 +221,12 @@ func (z *zClientTest) PutMetrics(ctx context.Context, in *zenoss.Metrics, opts .
 }
 
 func (z *zClientTest) PutModels(ctx context.Context, in *zenoss.Models, opts ...grpc.CallOption) (*zenoss.ModelStatusResult, error) {
-	j, err := json.MarshalIndent(in, "", "  ")
+	m := &jsonpb.Marshaler{Indent: "  "}
+	j, err := m.MarshalToString(in)
 	if err != nil {
 		return nil, err
 	}
+	log.Println(string(j))
 	result := &zenoss.ModelStatusResult{
 		Succeeded: int32(len(in.Models)),
 		Message:   "all good",
@@ -205,46 +238,40 @@ type dataBuilder struct {
 	defaultDimensions map[string]string
 	defaultMetaData   map[string]string
 	metrics           []telegraf.Metric
+	zDimOnly          bool
 }
 
 type modelBucket map[uint64]*zenoss.Model
 
-func (mb modelBucket) Models()[]*zenoss.Model{
-	models := []*zenoss.Model{}
-	for _, v := range mb{
+func (mb modelBucket) Models() []*zenoss.Model {
+	models := make([]*zenoss.Model, 0, len(mb))
+	for _, v := range mb {
 		models = append(models, v)
 	}
 	return models
 }
 
-func (mb modelBucket) Add(model *zenoss.Model){
-	h:= fnv.New64a()
-	b := make([]byte,8)
-	binary.LittleEndian.PutUint64(b, uint64(model.Timestamp))
-	h.Write(b)
-	h.Write( []byte("\n"))	
-	dims := model.GetDimensions()
-	keys := []string{}
-	for key := range dims{
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys{
-		h.Write( []byte(key))
-		h.Write( []byte("\n"))
-		v := dims[key]
-		h.Write( []byte(v))
-		h.Write( []byte("\n"))
-	}
-	mb[h.Sum64()] = model	
+type hashModel struct {
+	Dimensions map[string]string
+	MetaData   *structpb.Struct
 }
 
+func (mb modelBucket) Add(model *zenoss.Model) {
+	hModel := hashModel{model.GetDimensions(), model.GetMetadataFields()}
+	hash, err := hashstructure.Hash(hModel, nil)
+	if err != nil {
+		log.Printf("could not hash into bucket: ", err)
+	}
+	// log.Printf("Hash %d for %+v", hash, model)
+	mb[hash] = model
+}
 
 func newDataBuilder(dimensions map[string]string, metadata map[string]string) *dataBuilder {
 	return &dataBuilder{
 		defaultDimensions: dimensions,
 		defaultMetaData:   metadata,
 		metrics:           []telegraf.Metric{},
+		zDimOnly:          true,
 	}
 }
 
@@ -252,43 +279,74 @@ func (d *dataBuilder) AddMetric(metric telegraf.Metric) {
 	d.metrics = append(d.metrics, metric)
 }
 
+var filteredMetrics = map[string]bool{}
+
 func (d *dataBuilder) ZenossData() ([]*zenoss.Metric, []*zenoss.Model) {
+	defer logElapsed("Databuilder ZenossData", time.Now())
 	zMetrics := []*zenoss.Metric{}
 	zModels := make(modelBucket)
 
 	for _, metric := range d.metrics {
 		timestamp := metric.Time().UnixNano() / 1e6
+
+		hasZdim := false
+		for k := range metric.Tags() {
+			if strings.HasPrefix(k, "zdim") {
+				hasZdim = true
+				break
+			}
+		}
+		s, err := serializer.NewSerializer(time.Millisecond)
+		if err != nil {
+			log.Printf("blam %s", err)
+		}
+		if _, ok := filteredMetrics[metric.Name()]; ok {
+			// mjson, _ := s.Serialize(metric)
+			// log.Printf("Dropping filtered metric %s", string(mjson))
+			continue
+		}
+		if d.zDimOnly && !hasZdim {
+			mjson, _ := s.Serialize(metric)
+			log.Printf("Dropping metric withoug zdim: [%+v]\n", string(mjson))
+			continue
+		}
+		// mjson, _ := s.Serialize(metric)
+		// log.Printf("processing metric: [%+v]\n", string(mjson))
+
+		zdim, zmeta := getZenossDimensionsAndMetaData(metric)
+		//TODO: should sanitize tag keys and values
+		dimensions := make(map[string]string, len(zdim)+len(d.defaultDimensions))
+		for k, v := range d.defaultDimensions {
+			dimensions[k] = v
+		}
+		for k, v := range zdim {
+			dimensions[k] = v
+		}
+		metadata := make(map[string]string, len(zmeta)+len(d.defaultMetaData))
+		for k, v := range d.defaultMetaData {
+			metadata[k] = v
+		}
+		for k, v := range zmeta {
+			metadata[k] = v
+		}
+		metadataPB := toStruct(metadata)
 		for _, field := range metric.FieldList() {
 			value, err := getFloat(field.Value)
 			if err != nil {
 				log.Printf("W! [outputs.zenoss] get float failed: %s", err)
 				continue
 			}
-			//TODO: should sanitize tag keys and values
-			dimensions := make(map[string]string, len(metric.Tags()))
-			for k, v := range d.defaultDimensions {
-				dimensions[k] = v
-			}
-			for k, v := range metric.Tags() {
-				dimensions[k] = v
-			}
 
-			metadata := make(map[string]string)
-			for k, v := range d.defaultMetaData {
-				metadata[k] = v
-			}
-			metadataPB := toStruct(metadata)
 			name := fmt.Sprintf("%s.%s", metric.Name(), field.Key)
 			zMetrics = append(zMetrics, &zenoss.Metric{
 				Metric:         name,
 				Timestamp:      timestamp,
 				Dimensions:     dimensions,
-				MetadataFields: metadataPB,
+				MetadataFields: toStruct(d.defaultMetaData),
 				Value:          value,
 			})
 
-			metadata[zenossNameField] = name
-			zModels.Add( &zenoss.Model{
+			zModels.Add(&zenoss.Model{
 				Timestamp:      timestamp,
 				Dimensions:     dimensions,
 				MetadataFields: metadataPB,
@@ -299,6 +357,32 @@ func (d *dataBuilder) ZenossData() ([]*zenoss.Metric, []*zenoss.Model) {
 	return zMetrics, zModels.Models()
 }
 
+func getZenossDimensionsAndMetaData(m telegraf.Metric) (map[string]string, map[string]string) {
+	// extract zdimensions if present
+	zdim := map[string]string{}
+	dim := map[string]string{}
+	meta := map[string]string{}
+	for k, v := range m.Tags() {
+		// zdim_ prefix are explicitly set dimensions
+		if strings.HasPrefix(k, "zdim_") {
+			zdim[strings.TrimPrefix(k, "zdim_")] = v
+		} else if k == "zname" {
+			meta[zenossNameField] = v
+		} else {
+			dim[k] = v
+		}
+	}
+
+	if len(zdim) > 0 {
+		//we have zenoss dimensions identified, move all others to metadata
+		for k, v := range dim {
+			meta[k] = v
+		}
+	} else {
+		zdim = dim
+	}
+	return zdim, meta
+}
 func toStruct(m map[string]string) *structpb.Struct {
 	fields := map[string]*structpb.Value{}
 
@@ -329,16 +413,21 @@ func getFloat(val interface{}) (float64, error) {
 		return 0, fmt.Errorf("unsupported metric value: [%s] of type [%T]", v, v)
 	}
 }
+
+func logElapsed(msg string, start time.Time) {
+	log.Printf("%s; Elapsed: %d ms", msg, time.Since(start).Milliseconds())
+}
+
 func init() {
 	outputs.Add("zenoss", func() telegraf.Output {
 		hostName, err := os.Hostname()
-		if err != nil{
+		if err != nil {
 			hostName = "unknown"
 		}
 		hostName = fmt.Sprintf("zenoss.telegraf.%s", hostName)
 		return &Zenoss{
-			Address:         zenossAddress,
-			defaultMetaData: map[string]string{zenossSourceTypeField: zenossSourceType},
+			Address:           zenossAddress,
+			defaultMetaData:   map[string]string{zenossSourceTypeField: zenossSourceType},
 			defaultDimensions: map[string]string{zenossSourceField: hostName},
 		}
 	})
