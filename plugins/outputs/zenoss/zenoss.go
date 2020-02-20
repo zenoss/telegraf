@@ -384,13 +384,30 @@ func getZenossDimensionsAndMetaData(m telegraf.Metric) (map[string]string, map[s
 	return zdim, meta
 }
 func toStruct(m map[string]string) *structpb.Struct {
-	fields := map[string]*structpb.Value{}
-
+	fields := make(map[string]*structpb.Value, len(m))
 	for k, v := range m {
-		fields[k] = valueFromString(v)
+		if k == "impactToDimensions" {
+			fields[k] = valueFromStringSlice([]string{v})
+		} else {
+			fields[k] = valueFromString(v)
+		}
 	}
 
 	return &structpb.Struct{Fields: fields}
+}
+
+func valueFromStringSlice(ss []string) *structpb.Value {
+	stringValues := make([]*structpb.Value, len(ss))
+	for i, s := range ss {
+		stringValues[i] = valueFromString(s)
+	}
+	return &structpb.Value{
+		Kind: &structpb.Value_ListValue{
+			ListValue: &structpb.ListValue{
+				Values: stringValues,
+			},
+		},
+	}
 }
 
 func valueFromString(s string) *structpb.Value {

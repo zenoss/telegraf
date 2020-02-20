@@ -1,7 +1,7 @@
 package zenoss
 
 
-var vspherConfig =` 
+var vspherConfig =`
 ###############################################################################
 #                            ZENOSS PROCESSOR PLUGINS                         #
 ###############################################################################
@@ -17,6 +17,36 @@ var vspherConfig =`
   [[processors.rename.replace]]
     tag = "source"
     dest = "entity_source"
+
+
+#########################################
+# Zenoss  processor for vsphere cluster
+#########################################
+[[processors.rename]]
+  order=0
+  namepass=["vsphere_cluster_clusterServices", "vsphere_cluster_vmop"]
+  ## Specify one sub-table per rename operation.
+  [[processors.rename.replace]]
+    tag = "vcenter"
+    dest = "zdim_vcenter"
+  [[processors.rename.replace]]
+    tag = "dcname"
+    dest = "zdim_dcname"
+  [[processors.rename.replace]]
+    tag = "clustername"
+    dest = "zdim_clustername"  
+
+[[processors.template]]
+  order=1
+  namepass=["vsphere_cluster_clusterServices", "vsphere_cluster_vmop"]
+  tag = "type"
+  template = 'vsphere.cluster'
+
+[[processors.template]]
+  order=1
+  namepass=["vsphere_cluster_clusterServices", "vsphere_cluster_vmop"]
+  tag = "zname"
+  template = '{{ .Tag "zdim_vcenter" }}/{{ .Tag "zdim_dcname" }}/{{ .Tag "zdim_clustername"}}'
 
 
 #########################################
@@ -40,10 +70,16 @@ var vspherConfig =`
   tag = "zdim_datastore"
   template = '{{ .Tag "entity_source" }}'    
 [[processors.template]]
-  order=1
+  order=2
   namepass=["vsphere_datastore_datastore"]
   tag = "zname"
   template = '{{ .Tag "zdim_vcenter" }}/{{ .Tag "zdim_dcname" }}/{{ .Tag "zdim_datastore"}}'
+
+[[processors.template]]
+  order=1
+  namepass=["vsphere_datastore_datastore"]
+  tag = "type"
+  template = 'vsphere.datastore'
 
 #########################################
 # Zenoss  processor for vsphere datacenter
@@ -64,6 +100,11 @@ var vspherConfig =`
   tag = "zname"
   template = '{{ .Tag "zdim_vcenter" }}/{{ .Tag "zdim_dcname" }}'
 
+[[processors.template]]
+  order=1
+  namepass=["vsphere_datacenter_vmop"]
+  tag = "type"
+  template = 'vsphere.datacenter'
 
 #########################################
 # Zenoss shared processor for vsphere hosts
@@ -84,6 +125,25 @@ var vspherConfig =`
   [[processors.rename.replace]]
     tag = "dcname"
     dest = "zdim_dcname"
+
+# # impact to host from cpu, disk and net
+[[processors.template]]
+  order=200
+  namepass=["vsphere_host_mem", "vsphere_host_sys", "vsphere_host_storageAdapter", "vsphere_host_power", "vsphere_host_cpu", "vsphere_host_net", "vsphere_host_disk"]
+  tag = "impactToDimensions"
+  # template = 'vcenter={{ .Tag "zdim_vcenter" }},dcname={{ .Tag "zdim_dcname" }},host={{ .Tag "esxhostname" }}'
+  template = '''source=zenoss.telegraf.truffle.local,vcenter={{- .Tag "zdim_vcenter" -}},dcname={{- .Tag "zdim_dcname" -}}
+                {{if not (eq (.Tag "type") "vsphere.host") }},host={{ .Tag "zdim_host" }}{{- end -}}
+              '''
+
+#host type processors
+[[processors.template]]
+  # determine types for host and subtypes
+  #needs to be last processor for vsphere_host metrics
+  order=100
+  namepass=["vsphere_host_mem", "vsphere_host_sys", "vsphere_host_power","vsphere_host_cpu", "vsphere_host_disk", "vsphere_host_net", "vsphere_host_storageAdapter"]
+  tag = "type"
+  template = 'vsphere.{{if .Tag "zdim_cpu" }}cpu{{else if .Tag "zdim_interface" }}interface{{else if .Tag "zdim_disk" }}disk{{else if .Tag "zdim_adapter" }}storageAdapter{{else}}host{{end}}'
 
 ###################################
 # name for top level host metrics
@@ -136,11 +196,11 @@ var vspherConfig =`
     # set the value on a new tag
     result_key = "zdim_cpu"
 
-# Name for vm cpu
+# Name for host cpu
 [[processors.template]]
   order=3
   namepass=["vsphere_host_cpu"]
-  #drop cpu tag as zdim_interface is what we want
+  #ignore cpu tag as zdim_cpu is what we want
   tagexclude=["cpu"]
   tag = "zname"
   template = '{{ .Tag "zdim_vcenter" }}/{{ .Tag "zdim_dcname" }}/{{ .Tag "zdim_host" }}{{if .Tag "zdim_cpu" }}/{{ .Tag "zdim_cpu" }}{{end}}'
@@ -185,7 +245,7 @@ var vspherConfig =`
     # set the value on a new tag
     result_key = "zdim_disk"
 
-# Name for vm disk
+# Name for host disk
 [[processors.template]]
   order=3
   namepass=["vsphere_host_disk"]
@@ -234,7 +294,7 @@ var vspherConfig =`
     # set the value on a new tag
     result_key = "zdim_interface"
 
-## Name for vm net
+## Name for host net
 [[processors.template]]
   order=3
   namepass=["vsphere_host_net"]
@@ -284,6 +344,32 @@ var vspherConfig =`
   [[processors.rename.replace]]
     tag = "dcname"
     dest = "zdim_dcname"
+
+# Impact to vm host or vm depending on type
+[[processors.template]]
+  order=200
+  namepass=["vsphere_vm_mem", "vsphere_vm_sys", "vsphere_vm_power", "vsphere_vm_cpu", "vsphere_vm_virtualDisk", "vsphere_vm_net"]
+  tag = "impactToDimensions"
+  # template = 'vcenter={{ .Tag "zdim_vcenter" }},dcname={{ .Tag "zdim_dcname" }},host={{ .Tag "esxhostname" }}'
+  # template = 'vcenter={{ .Tag "zdim_vcenter" }},dcname={{ .Tag "zdim_dcname" }},{{if eq (.Tag "type") "vsphere.vm" }}host={{ .Tag "esxhostname" }}{{else}}vm={{ .Tag "zdim_vm" }}{{end}}'
+  # template = '{{if eq (.Tag "type") "vsphere.vm" }}host={{ .Tag "esxhostname" }}{{else}}vm={{ .Tag "zdim_vm" }}{{end}}'
+  template = '''source=zenoss.telegraf.truffle.local,vcenter={{ .Tag "zdim_vcenter" }},dcname={{ .Tag "zdim_dcname" }}
+                {{- if eq (.Tag "type") "vsphere.vm" -}}
+                  ,host={{ .Tag "esxhostname" }}
+                {{- else -}}
+                  ,vm={{ .Tag "zdim_vm" }}
+                {{- end -}}
+              '''
+
+
+#procssor for vm and sub types
+[[processors.template]]
+  # determine types for cpu and subtypes
+  #needs to be last processor for vsphere_host metrics
+  order=100
+  namepass=["vsphere_vm_mem", "vsphere_vm_sys", "vsphere_vm_power", "vsphere_vm_cpu", "vsphere_vm_virtualDisk", "vsphere_vm_net"]
+  tag = "type"
+  template = 'vsphere.{{if .Tag "zdim_cpu" }}vcpu{{else if .Tag "zdim_interface" }}vnic{{else if .Tag "zdim_disk" }}vdisk{{else}}vm{{end}}'
 
 ## Zenoss processor for vsphere_vm_mem vsphere_vm_sys vsphere_vm_power
 # Name for vm as these are part of the vm model
