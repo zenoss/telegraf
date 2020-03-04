@@ -13,7 +13,9 @@ import (
 	structpb "github.com/golang/protobuf/ptypes/struct"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/outputs"
-	serializer "github.com/influxdata/telegraf/plugins/serializers/json"
+
+	// serializer "github.com/influxdata/telegraf/plugins/serializers/json"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/mitchellh/hashstructure"
 	zenoss "github.com/zenoss/zenoss-protobufs/go/cloud/data_receiver"
 	"google.golang.org/grpc"
@@ -41,6 +43,8 @@ api_key = "secrete-key" # required
 #address = "api.zenoss.io:443"
 
 #stdout_client = false
+# If empty use os.hostname for source
+#source_host = ""
 `
 var processorConfigHeader = `
 
@@ -55,9 +59,11 @@ type Zenoss struct {
 	APIKey            string `toml:"api_key"`
 	Address           string
 	StdoutClient      bool
+	SourceHost        string
 	client            zenossClient
 	defaultMetaData   map[string]string
 	defaultDimensions map[string]string
+	l                 telegraf.Logger
 }
 
 type zenossClient interface {
@@ -71,12 +77,27 @@ var _ telegraf.Output = &Zenoss{}
 
 //Connect to the output
 func (z *Zenoss) Connect() error {
+	// Use configured source host if set
+	sourceHost := strings.TrimSpace(z.SourceHost)
+	if sourceHost == "" {
+		hostName, err := os.Hostname()
+		if err != nil {
+			sourceHost = "unknown"
+		} else {
+			sourceHost = hostName
+		}
+	}
+	sourceHost = fmt.Sprintf("zenoss.telegraf.%s", sourceHost)
+	z.defaultDimensions[zenossSourceField] = sourceHost
+
 	defer logElapsed("Connect", time.Now())
 	if z.StdoutClient {
 		z.client = &zClientTest{}
 	} else {
 		z.client = &zClient{}
 	}
+	modelCache, _ = lru.New(6000)
+
 	return z.client.Connect(z.Address)
 }
 
@@ -131,27 +152,32 @@ func (z *Zenoss) Write(metrics []telegraf.Metric) error {
 		metricResult <- metricErr
 	}()
 	start := time.Now()
-	modelStatus, err := z.client.PutModels(ctx, &zenoss.Models{
-		DetailedResponse: true,
-		Models:           zModels,
-	})
-	logElapsed("send models", start)
-	if err != nil {
-		log.Printf("ERROR: unable to send %d models: %v", len(zModels), err)
-	} else {
-		if modelStatus.GetFailed() > 0 {
-			log.Printf("ERROR: failed sending %d of %d models", modelStatus.GetFailed(), len(zModels))
+	var modelErr error
+	if len(zModels) > 0 {
+		modelStatus, err := z.client.PutModels(ctx, &zenoss.Models{
+			DetailedResponse: true,
+			Models:           zModels,
+		})
+		logElapsed("send models", start)
+		if err != nil {
+			log.Printf("ERROR: unable to send %d models: %v", len(zModels), err)
+		} else {
+			if modelStatus.GetFailed() > 0 {
+				log.Printf("ERROR: failed sending %d of %d models", modelStatus.GetFailed(), len(zModels))
+			}
+			log.Printf("sent %d models", modelStatus.GetSucceeded())
 		}
-		log.Printf("sent %d models", modelStatus.GetSucceeded())
+	}else{
+		log.Print("No new models to send")
 	}
 	metricErr := <-metricResult
-	if metricErr != nil && err != nil {
-		return fmt.Errorf("%s; %s", metricErr, err)
+	if metricErr != nil && modelErr != nil {
+		return fmt.Errorf("%s; %s", metricErr, modelErr)
 	}
 	if metricErr != nil {
 		return metricErr
 	}
-	return err
+	return modelErr
 }
 
 type zClient struct {
@@ -243,10 +269,14 @@ type dataBuilder struct {
 
 type modelBucket map[uint64]*zenoss.Model
 
+var modelCache *lru.Cache
+
 func (mb modelBucket) Models() []*zenoss.Model {
 	models := make([]*zenoss.Model, 0, len(mb))
-	for _, v := range mb {
-		models = append(models, v)
+	for key, v := range mb {
+		if contains, _ := modelCache.ContainsOrAdd(key, struct{}{}); !contains {
+			models = append(models, v)
+		}
 	}
 	return models
 }
@@ -296,18 +326,19 @@ func (d *dataBuilder) ZenossData() ([]*zenoss.Metric, []*zenoss.Model) {
 				break
 			}
 		}
-		s, err := serializer.NewSerializer(time.Millisecond)
-		if err != nil {
-			log.Printf("blam %s", err)
-		}
+		// s, err := serializer.NewSerializer(time.Millisecond)
+		// if err != nil {
+		// 	log.Printf("blam %s", err)
+		// }
 		if _, ok := filteredMetrics[metric.Name()]; ok {
 			// mjson, _ := s.Serialize(metric)
 			// log.Printf("Dropping filtered metric %s", string(mjson))
 			continue
 		}
 		if d.zDimOnly && !hasZdim {
-			mjson, _ := s.Serialize(metric)
-			log.Printf("Dropping metric withoug zdim: [%+v]\n", string(mjson))
+			// mjson, _ := s.Serialize(metric)
+			log.Printf("metricq withoug zdim: [%+v]\n", metric.Name())
+			// log.Printf("Dropping metric withoug zdim: [%+v]\n", string(mjson))
 			continue
 		}
 		// mjson, _ := s.Serialize(metric)
@@ -427,7 +458,7 @@ func getFloat(val interface{}) (float64, error) {
 	case float64:
 		return float64(v), nil
 	default:
-		return 0, fmt.Errorf("unsupported metric value: [%s] of type [%T]", v, v)
+		return 0, fmt.Errorf("	: [%s] of type [%T]", v, v)
 	}
 }
 
@@ -437,15 +468,11 @@ func logElapsed(msg string, start time.Time) {
 
 func init() {
 	outputs.Add("zenoss", func() telegraf.Output {
-		hostName, err := os.Hostname()
-		if err != nil {
-			hostName = "unknown"
-		}
-		hostName = fmt.Sprintf("zenoss.telegraf.%s", hostName)
 		return &Zenoss{
-			Address:           zenossAddress,
-			defaultMetaData:   map[string]string{zenossSourceTypeField: zenossSourceType},
-			defaultDimensions: map[string]string{zenossSourceField: hostName},
+			Address:         zenossAddress,
+			defaultMetaData: map[string]string{zenossSourceTypeField: zenossSourceType},
+			// defaultDimensions: map[string]string{zenossSourceField: hostName},
+			defaultDimensions: map[string]string{},
 		}
 	})
 }
